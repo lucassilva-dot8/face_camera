@@ -8,6 +8,43 @@ import 'package:face_camera/src/extension/nv21_converter.dart';
 import '../models/detected_image.dart';
 
 class FaceIdentifier {
+  // PATCH DOT8: detector reaproveitado entre frames.
+  //
+  // O original instanciava um FaceDetector dentro de _detectFace, ou seja, a
+  // cada frame do stream, e nunca chamava close(). Isso reconstruía o pipeline
+  // nativo do ML Kit (e o delegate do TensorFlow Lite) dezenas de vezes por
+  // segundo e vazava os detectores anteriores.
+  static FaceDetector? _faceDetector;
+  static FaceDetectorMode? _detectorMode;
+
+  static FaceDetector _detectorFor(FaceDetectorMode performanceMode) {
+    final detector = _faceDetector;
+    if (detector != null && _detectorMode == performanceMode) {
+      return detector;
+    }
+
+    detector?.close();
+    _detectorMode = performanceMode;
+    return _faceDetector = FaceDetector(
+      options: FaceDetectorOptions(
+        enableLandmarks: true,
+        enableTracking: true,
+        performanceMode: performanceMode,
+      ),
+    );
+  }
+
+  /// Libera o detector nativo.
+  ///
+  /// Chamado por [FaceCameraController.dispose]. O detector é recriado sob
+  /// demanda no próximo frame, então fechá-lo é sempre seguro.
+  static Future<void> close() async {
+    final detector = _faceDetector;
+    _faceDetector = null;
+    _detectorMode = null;
+    await detector?.close();
+  }
+
   static Future<DetectedFace?> scanImage(
       {required CameraImage cameraImage,
       required CameraController? controller,
@@ -92,11 +129,7 @@ class FaceIdentifier {
       {required InputImage? visionImage,
       required FaceDetectorMode performanceMode}) async {
     if (visionImage == null) return null;
-    final options = FaceDetectorOptions(
-        enableLandmarks: true,
-        enableTracking: true,
-        performanceMode: performanceMode);
-    final faceDetector = FaceDetector(options: options);
+    final faceDetector = _detectorFor(performanceMode);
     try {
       final List<Face> faces = await faceDetector.processImage(visionImage);
       final faceDetect = _extractFace(faces);

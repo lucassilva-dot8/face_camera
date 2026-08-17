@@ -56,6 +56,23 @@ class FaceCameraController extends ValueNotifier<FaceCameraState> {
   /// Callback invoked when camera detects face.
   final void Function(Face? face)? onFaceDetected;
 
+  // PATCH DOT8: o controller precisa saber que foi descartado.
+  //
+  // `initialize()` é assíncrono e era disparado sem await pelo initState do
+  // SmartFaceCamera. Fechando a tela no meio da inicialização, o
+  // `startImageStream()` do final de `_initCamera` subia o pipeline de detecção
+  // com o widget já destruído, e a câmera ficava aberta indefinidamente.
+  bool _isDisposed = false;
+
+  /// Whether [dispose] has already been called.
+  bool get isDisposed => _isDisposed;
+
+  @override
+  set value(FaceCameraState newValue) {
+    if (_isDisposed) return;
+    super.value = newValue;
+  }
+
   /// Gets all available camera lens and set current len
   void _getAllAvailableCameraLens() {
     int currentCameraLens = 0;
@@ -81,6 +98,8 @@ class FaceCameraController extends ValueNotifier<FaceCameraState> {
   }
 
   Future<void> _initCamera() async {
+    if (_isDisposed || value.availableCameraLens.isEmpty) return;
+
     final cameras = FaceCamera.cameras
         .where((c) =>
             c.lensDirection ==
@@ -88,32 +107,59 @@ class FaceCameraController extends ValueNotifier<FaceCameraState> {
                 value.availableCameraLens[value.currentCameraLens]))
         .toList();
 
-    if (cameras.isNotEmpty) {
-      final cameraController = CameraController(cameras.first,
-          EnumHandler.imageResolutionToResolutionPreset(imageResolution),
-          enableAudio: enableAudio,
-          imageFormatGroup: Platform.isAndroid
-              ? ImageFormatGroup.nv21
-              : ImageFormatGroup.bgra8888);
+    if (cameras.isEmpty) return;
 
-      await cameraController.initialize().whenComplete(() {
-        value = value.copyWith(
-            isInitialized: true, cameraController: cameraController);
-      });
-
-      await changeFlashMode(value.availableFlashMode.indexOf(defaultFlashMode));
-
-      await cameraController.lockCaptureOrientation(
-          EnumHandler.cameraOrientationToDeviceOrientation(orientation));
+    // PATCH DOT8: libera a câmera anterior. `changeCameraLens()` chamava este
+    // método sem descartar o controller antigo, abrindo uma segunda sessão.
+    final previous = value.cameraController;
+    if (previous != null) {
+      value = value.copyWith(isInitialized: false);
+      await previous.dispose();
     }
 
-    startImageStream();
+    final cameraController = CameraController(cameras.first,
+        EnumHandler.imageResolutionToResolutionPreset(imageResolution),
+        enableAudio: enableAudio,
+        imageFormatGroup: Platform.isAndroid
+            ? ImageFormatGroup.nv21
+            : ImageFormatGroup.bgra8888);
+
+    try {
+      await cameraController.initialize();
+    } on CameraException catch (e) {
+      _showCameraException(e);
+      await cameraController.dispose();
+      return;
+    }
+
+    // PATCH DOT8: a tela pode ter sido fechada enquanto a câmera inicializava.
+    if (_isDisposed) {
+      await cameraController.dispose();
+      return;
+    }
+
+    value =
+        value.copyWith(isInitialized: true, cameraController: cameraController);
+
+    await changeFlashMode(value.availableFlashMode.indexOf(defaultFlashMode));
+
+    if (_isDisposed) return;
+
+    await cameraController.lockCaptureOrientation(
+        EnumHandler.cameraOrientationToDeviceOrientation(orientation));
+
+    await startImageStream();
   }
 
   Future<void> changeFlashMode([int? index]) async {
+    final cameraController = value.cameraController;
+    if (cameraController == null || !cameraController.value.isInitialized) {
+      return;
+    }
+
     final newIndex =
         index ?? (value.currentFlashMode + 1) % value.availableFlashMode.length;
-    await value.cameraController!
+    await cameraController
         .setFlashMode(EnumHandler.cameraFlashModeToFlashMode(
             value.availableFlashMode[newIndex]))
         .then((_) {
@@ -131,10 +177,11 @@ class FaceCameraController extends ValueNotifier<FaceCameraState> {
   }
 
   Future<void> changeCameraLens() async {
+    if (_isDisposed || value.availableCameraLens.isEmpty) return;
     value = value.copyWith(
         currentCameraLens:
             (value.currentCameraLens + 1) % value.availableCameraLens.length);
-    _initCamera();
+    await _initCamera();
   }
 
   Future<XFile?> takePicture() async {
@@ -163,6 +210,9 @@ class FaceCameraController extends ValueNotifier<FaceCameraState> {
   }
 
   Future<void> startImageStream() async {
+    // PATCH DOT8: nunca religar o stream depois do dispose.
+    if (_isDisposed) return;
+
     final CameraController? cameraController = value.cameraController;
     if (cameraController == null || !cameraController.value.isInitialized) {
       return;
@@ -183,6 +233,10 @@ class FaceCameraController extends ValueNotifier<FaceCameraState> {
   }
 
   void _processImage(CameraImage cameraImage) async {
+    // PATCH DOT8: frames que já estavam na fila não devem alimentar o detector
+    // depois que a tela foi fechada.
+    if (_isDisposed) return;
+
     final CameraController? cameraController = value.cameraController;
     if (!value.alreadyCheckingImage) {
       value = value.copyWith(alreadyCheckingImage: true);
@@ -223,16 +277,26 @@ class FaceCameraController extends ValueNotifier<FaceCameraState> {
 
   void captureImage() async {
     final CameraController? cameraController = value.cameraController;
+    if (cameraController == null || !cameraController.value.isInitialized) {
+      logError('Error: select a camera first.');
+      return;
+    }
+
     try {
-      cameraController!.stopImageStream().whenComplete(() async {
-        await Future.delayed(const Duration(milliseconds: 500));
-        takePicture().then((XFile? file) {
-          /// Return image callback
-          if (file != null) {
-            onCapture.call(File(file.path));
-          }
-        });
-      });
+      if (cameraController.value.isStreamingImages) {
+        await cameraController.stopImageStream();
+      }
+      await Future.delayed(const Duration(milliseconds: 500));
+
+      // PATCH DOT8: a tela pode ter sido fechada durante a espera.
+      if (_isDisposed) return;
+
+      final XFile? file = await takePicture();
+
+      /// Return image callback
+      if (file != null) {
+        onCapture.call(File(file.path));
+      }
     } catch (e) {
       logError(e.toString());
     }
@@ -253,9 +317,14 @@ class FaceCameraController extends ValueNotifier<FaceCameraState> {
     cameraController.setFocusPoint(offset);
   }*/
 
+  /// Initialize the camera and start the face detection pipeline.
+  ///
+  /// PATCH DOT8: agora aguarda a inicialização, para que quem chama consiga
+  /// saber quando a câmera está de fato pronta (o original era fire-and-forget).
   Future<void> initialize() async {
+    if (_isDisposed) return;
     _getAllAvailableCameraLens();
-    _initCamera();
+    await _initCamera();
   }
 
   /// Enables controls only when camera is initialized.
@@ -267,13 +336,29 @@ class FaceCameraController extends ValueNotifier<FaceCameraState> {
   /// Dispose the controller.
   ///
   /// Once the controller is disposed, it cannot be used anymore.
+  ///
+  /// PATCH DOT8: o original só descartava o [CameraController] quando ele já
+  /// estava inicializado, não aguardava o descarte e deixava o detector do
+  /// ML Kit aberto. Sem isso a sessão da câmera continuava listada em
+  /// `dumpsys media.camera` mesmo depois de sair da tela.
   @override
   Future<void> dispose() async {
-    final CameraController? cameraController = value.cameraController;
+    if (_isDisposed) return;
+    _isDisposed = true;
 
-    if (cameraController != null && cameraController.value.isInitialized) {
-      cameraController.dispose();
+    final CameraController? cameraController = value.cameraController;
+    if (cameraController != null) {
+      try {
+        if (cameraController.value.isStreamingImages) {
+          await cameraController.stopImageStream();
+        }
+      } catch (e) {
+        logError(e.toString());
+      }
+      await cameraController.dispose();
     }
+
+    await FaceIdentifier.close();
     super.dispose();
   }
 }

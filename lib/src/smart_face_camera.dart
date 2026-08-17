@@ -90,6 +90,21 @@ class _SmartFaceCameraState extends State<SmartFaceCamera>
     super.initState();
   }
 
+  // PATCH DOT8: trocar o controller em rebuild deixa o anterior órfão — com a
+  // câmera aberta e o detector rodando — porque o initState (que é quem chama
+  // initialize()) não roda de novo. O controller deve ser criado no initState
+  // de quem usa este widget; no app isso é o FaceCaptureView.
+  @override
+  void didUpdateWidget(SmartFaceCamera oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (!identical(oldWidget.controller, widget.controller)) {
+      debugPrint('SmartFaceCamera: o FaceCameraController foi trocado durante '
+          'um rebuild. Crie-o uma única vez (initState) e descarte-o no '
+          'dispose, senão a câmera anterior fica aberta.');
+      oldWidget.controller.stopImageStream();
+    }
+  }
+
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
@@ -104,7 +119,8 @@ class _SmartFaceCameraState extends State<SmartFaceCamera>
     } else if (state == AppLifecycleState.paused) {
       widget.controller.stopImageStream();
     } else if (state == AppLifecycleState.resumed) {
-      widget.controller.startImageStream();
+      // PATCH DOT8: não religar o stream de um widget já desmontado.
+      if (mounted) widget.controller.startImageStream();
     }
   }
 
