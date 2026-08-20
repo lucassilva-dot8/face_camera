@@ -355,10 +355,18 @@ class FaceCameraController extends ValueNotifier<FaceCameraState> {
       } catch (e) {
         logError(e.toString());
       }
-      await cameraController.dispose();
+      try {
+        await cameraController.dispose();
+      } catch (e) {
+        logError(e.toString());
+      }
     }
 
-    await FaceIdentifier.close();
+    try {
+      await FaceIdentifier.close();
+    } catch (e) {
+      logError(e.toString());
+    }
     super.dispose();
   }
 }
